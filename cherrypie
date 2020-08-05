@@ -1,0 +1,155 @@
+#!/bin/bash
+#### VARS
+# URL of your TPOT elasticsearch instance.
+URL=""
+# Whether the above uses HTTPS and a self signed certificate. 0 for off.
+INSECURE=0
+# A String to indicate your protected (local) IPs.
+PROTECTED_IPS="10.*"
+# A username to authenticate with (if needed)
+USERNAME=""
+# Ditto
+PASSWORD=""
+# The number of attempts an attacker needs to make to get banned
+BANCOUNT=30
+# Logfile location
+LOGFILE="/var/log/cherrypie.log"
+####
+
+# saner programming env: these switches turn some bugs into errors
+set -o errexit -o pipefail -o noclobber -o nounset
+TIME=$(date --rfc-3339=seconds)
+BANNED_IPS=$(iptables -S INPUT | grep DROP | awk '{print $4}' | sed 's/\/32//g') || true
+# Function to print out usage
+function usage() {
+  cat << EOF
+Usage:
+  cherrypie run
+  cherrypie check
+  cherrypie [command] <IP>
+Commands:
+  run           Executes cherrypie and bans IPs
+  check         Runs a test for permissions and connectivity
+  ban-ip        Bans the specified IP address permanently
+  unban-ip      Unbans the specifid IP address
+EOF
+}
+
+function valid_ip()
+{
+  local ip=$1
+  ip=$(echo $ip )
+  if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+function banip () {
+  sudo iptables -A INPUT -s $IP -j DROP
+}
+
+function checkban () {
+
+  echo $BANNED_IPS | grep $1 > /dev/null || (
+  echo "$TIME: $IP is not banned, banning" >> $LOGFILE
+  banip $IP
+  ) && echo "$TIME: $IP is banned"
+}
+
+function check() {
+  # Check if URL exists.
+  if [ -z ${URL+x} ]; then
+    echo "Please make sure the variable URL is set."
+    exit 1
+  else
+    echo "URL exists and is set to '$URL'";
+  fi
+  # Check for JQ
+  which jq >> /dev/null \
+    && echo "jq exists" \
+    || (echo "please install jq." && exit 1)
+  # Run a DNS probe for the host
+  readonly URI_REGEX='^(([^:/?#]+):)?(//((([^:/?#]+)@)?([^:/?#]+)(:([0-9]+))?))?(/([^?#]*))(\?([^#]*))?(#(.*))?'
+  [[ "$URL" =~ $URI_REGEX ]] && HOST="${BASH_REMATCH[7]}"
+  host $HOST >> /dev/null \
+    && echo "Able to query host" \
+    || (echo "Unable to query host" && exit 1)
+  # Run a CURL against the host
+  curl -s "$URL" >> /dev/null \
+    && echo "Able to get data" \
+    || (echo "Unable to get data" && exit 1)
+  # Grab Data and pipe to JQ
+  curl -s "$URL" | jq >> /dev/null \
+    && echo "Jq Parsing passed" \
+    || (echo "Jq Parsing failed")
+  # Check for IPtables
+  iptables -S INPUT >> /dev/null \
+    && echo "Iptables passed" \
+    || (echo "Iptables check failed" && exit 1)
+  exit 0
+}
+
+function get_data() {
+  local EXTOPS=""
+  local HEADERS="Content-Type: application/json"
+  local IFS='"'
+  if [ ! -z "$USERNAME" ] && [ ! -z "$PASSWORD" ]; then
+    EXTOPS=$EXTOPS:"--user $USERNAME:$PASSWORD"
+  fi
+  [ $INSECURE -eq 1 ] && EXTOPS="$EXTOPS --insecure"
+  IPLIST=$(echo "{\"_source\": \"src_ip\",\"size\": 2000,\"sort\": [{\"@timestamp\":{\"order\":\"desc\",\"unmapped_type\":\"boolean\"}}],\"query\": {\"bool\": { \"must\": [{\"match_all\": {}},{\"query_string\": {\"query\": \"*\",\"analyze_wildcard\": true,\"time_zone\": \"Europe/London\"}}],\"filter\": [{\"exists\": {\"field\": \"src_ip\"}}],\"should\": [],\"must_not\": [{\"query_string\": {\"query\": \"src_ip: PROTIPS\"}}]}}}" | jq -r ".query.bool.must_not[].query_string.query |= \"src_ip: $PROTECTED_IPS\"" | curl $EXTOPS -s -XGET \
+    "$URL" \
+    -H "$HEADERS" \
+    -d @- | jq '.hits.hits[]._source.src_ip' | sort | uniq -c | sort -nr | tr '\n' ';' | sed 's/"//g')
+  local IFS=';'
+  read -ra IPLIST <<< "$IPLIST"
+}
+
+function play() {
+  get_data
+  for i in "${IPLIST[@]}"; do
+      COUNT=$(echo $i | awk '{print $1}')
+      IP=$(echo $i | awk '{print $2}')
+      if valid_ip $IP; then
+        if (( $COUNT > $BANCOUNT)); then
+          checkban $IP
+        fi
+      fi
+  done
+}
+
+# Funtion to ban IP addresses
+ban-ip () {
+  if $(echo $BANNED_IPS | grep $1 >> /dev/null); then
+    echo "$1 is already banned!"
+    exit 1
+  else
+    if valid_ip $1; then
+    iptables -A INPUT -s $1 -j DROP && (echo "$1 is banned" && exit 0) || \
+      echo "An error occured :("
+    fi
+  fi
+}
+
+unban-ip () {
+  echo $BANNED_IPS | grep $1 > /dev/null || \
+  (echo "$1 is not banned!" && exit 1) && \
+  if valid_ip $1; then
+    iptables -D INPUT -s $1 -j DROP && echo "$1 is now unbanned" || \
+      echo "An error occured :("
+  fi
+
+}
+
+while [[ "$#" -gt 0 ]]; do
+    case $1 in
+        ban-ip) ban-ip "$2"; shift ;;
+        unban-ip) unban-ip "$2"; shift ;;
+        check) check; ;;
+        run) play; ;;
+        *) usage; echo "Unknown parameter passed: $1";  exit 1 ;;
+    esac
+    shift
+done
